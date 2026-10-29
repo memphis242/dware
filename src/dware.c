@@ -3,11 +3,17 @@
  *
  * Each word is chosen uniformly from 7776 (6^5) entries using the kernel CSPRNG,
  * giving log2(7776) ~= 12.92 bits of entropy per word. The wordlist is compiled
- * in as a fixed-width read-only table, so a run touches only the pages holding
- * the words it prints. The passphrase is assembled in one stack buffer, written
- * with write(2) (bypassing stdio buffers), and wiped before exit.
+ * in as a fixed-width read-only table with no pointers to relocate. Core dumps
+ * are disabled, the passphrase is assembled in one stack buffer, written with
+ * write(2) (bypassing stdio buffers), and wiped along with the random draws
+ * before exit.
  */
-#define _DEFAULT_SOURCE
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
+#ifndef __STDC_WANT_LIB_EXT1__
+#define __STDC_WANT_LIB_EXT1__ 1 /* memset_s on Apple platforms */
+#endif
 
 #include <assert.h>
 #include <errno.h>
@@ -16,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/random.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include "wordlist.h"
@@ -59,6 +66,26 @@ struct options {
 
 enum parse_result { PARSE_RUN, PARSE_EXIT_OK, PARSE_EXIT_USAGE };
 
+/* Zeroes memory in a way the compiler may not elide as a dead store. */
+static void secure_zero(void *const buf, const size_t len)
+{
+#if defined(__APPLE__)
+    memset_s(buf, len, 0, len);
+#elif defined(__NetBSD__)
+    explicit_memset(buf, 0, len);
+#else
+    explicit_bzero(buf, len);
+#endif
+}
+
+static void disable_core_dumps(void)
+{
+    const struct rlimit none = {.rlim_cur = 0, .rlim_max = 0};
+    if (setrlimit(RLIMIT_CORE, &none) != 0) {
+        fprintf(stderr, "dware: warning: cannot disable core dumps: %s\n", strerror(errno));
+    }
+}
+
 static void print_usage(FILE *const stream)
 {
     fprintf(stream,
@@ -72,6 +99,16 @@ static void print_usage(FILE *const stream)
             "  -h            show this help\n"
             "  -V            show the version\n",
             MAX_WORDS, DEFAULT_WORDS, (double)DEFAULT_WORDS * BITS_PER_WORD, MAX_SEP_LEN);
+}
+
+/* Flushes stdout, reporting whether everything printed to it was written. */
+static bool flush_stdout(void)
+{
+    if (fflush(stdout) != 0 || ferror(stdout)) {
+        fprintf(stderr, "dware: cannot write to stdout: %s\n", strerror(errno));
+        return false;
+    }
+    return true;
 }
 
 static bool parse_words(const char *const arg, size_t *const words)
@@ -139,20 +176,21 @@ static bool fill_random(void *const buf, const size_t len)
     return true;
 }
 
-/* Maps a uniform 32-bit draw to a uniform word index, redrawing the rare biased values. */
-static bool pick_index(uint32_t draw, size_t *const index)
+/* Maps a uniform 32-bit draw to a uniform word index, redrawing the rare biased values
+ * in place so that every random byte stays in the caller's (wiped) buffer. */
+static bool pick_index(uint32_t *const draw, size_t *const index)
 {
-    for (int redraws = 0; draw < REJECT_BELOW; ++redraws) {
+    for (int redraws = 0; *draw < REJECT_BELOW; ++redraws) {
         if (redraws == MAX_REDRAWS) {
             fprintf(stderr, "dware: the random source returned %d consecutive out-of-range values; refusing to continue\n",
                     MAX_REDRAWS);
             return false;
         }
-        if (!fill_random(&draw, sizeof draw)) {
+        if (!fill_random(draw, sizeof *draw)) {
             return false;
         }
     }
-    *index = draw % WORDLIST_COUNT;
+    *index = *draw % WORDLIST_COUNT;
     assert(*index < WORDLIST_COUNT);
     return true;
 }
@@ -188,7 +226,7 @@ static size_t build_passphrase(const struct options *const opts, char out[static
     size_t len = 0;
     for (size_t i = 0; i < opts->words; ++i) {
         size_t index = 0;
-        if (!pick_index(draws[i], &index)) {
+        if (!pick_index(&draws[i], &index)) {
             return 0;
         }
         const char *const word = wordlist[index];
@@ -210,12 +248,14 @@ static size_t build_passphrase(const struct options *const opts, char out[static
 
 int main(int argc, char *argv[])
 {
+    disable_core_dumps();
+
     struct options opts = {.words = DEFAULT_WORDS, .sep = " ", .sep_len = 1, .show_entropy = false};
     switch (parse_options(argc, argv, &opts)) {
     case PARSE_RUN:
         break;
     case PARSE_EXIT_OK:
-        return STATUS_OK;
+        return flush_stdout() ? STATUS_OK : STATUS_RUNTIME_ERROR;
     case PARSE_EXIT_USAGE:
         return STATUS_USAGE_ERROR;
     }
@@ -224,15 +264,16 @@ int main(int argc, char *argv[])
     uint32_t draws[MAX_WORDS] = {0};
     const size_t len = build_passphrase(&opts, out, draws);
     const bool ok = len > 0 && write_all(STDOUT_FILENO, out, len);
-    explicit_bzero(out, sizeof out);
-    explicit_bzero(draws, sizeof draws);
+    secure_zero(out, sizeof out);
+    secure_zero(draws, sizeof draws);
     if (!ok) {
         return STATUS_RUNTIME_ERROR;
     }
 
-    if (opts.show_entropy) {
-        fprintf(stderr, "%zu words x %.2f bits = %.1f bits of entropy\n", opts.words, BITS_PER_WORD,
-                (double)opts.words * BITS_PER_WORD);
+    /* stderr is unwritable if this fails, so the exit status is the only report left. */
+    if (opts.show_entropy && fprintf(stderr, "%zu words x %.2f bits = %.1f bits of entropy\n", opts.words,
+                                     BITS_PER_WORD, (double)opts.words * BITS_PER_WORD) < 0) {
+        return STATUS_RUNTIME_ERROR;
     }
     return STATUS_OK;
 }

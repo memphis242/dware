@@ -9,12 +9,18 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        cc: [gcc-14, clang-18]
+        include:
+          - os: ubuntu-24.04
+            cc: gcc-14
+          - os: ubuntu-24.04
+            cc: clang-18
+          - os: macos-latest
+            cc: clang
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build and test
-        run: make test CC=${{ matrix.cc }} CFLAGS="-O2 -Werror" JOBS="$(nproc)"
+        run: make test CC=${{ matrix.cc }} CFLAGS="-O2 -Werror" DEBUG_CFLAGS="-O1 -g -Werror"
