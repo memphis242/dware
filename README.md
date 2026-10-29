@@ -17,7 +17,7 @@ relic.ebony.bluish.legwarmer.encode.animating.evasive.challenge
   1.4 MB, which is the baseline cost of starting any C program on glibc.
 - **No dependencies.** Building needs a C23 compiler, GNU make, `awk`, and
   `sha256sum` (or `shasum`). Nothing is downloaded at build or run time.
-- **Auditable.** About 250 lines of C. The wordlist is pinned by sha256 and
+- **Auditable.** Under 300 lines of C. The wordlist is pinned by sha256 and
   checked structurally before it is compiled in.
 
 ## Usage
